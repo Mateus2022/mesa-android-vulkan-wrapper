@@ -47,6 +47,7 @@ enum wsi_image_type {
    WSI_IMAGE_TYPE_CPU,
    WSI_IMAGE_TYPE_DRM,
    WSI_IMAGE_TYPE_DXGI,
+   WSI_IMAGE_TYPE_AHB,
 };
 
 struct wsi_base_image_params {
@@ -165,6 +166,9 @@ struct wsi_image {
    int dma_buf_fd;
 #endif
    void *cpu_map;
+#ifdef __TERMUX__
+   AHardwareBuffer *ahb;
+#endif
 };
 
 struct wsi_swapchain {

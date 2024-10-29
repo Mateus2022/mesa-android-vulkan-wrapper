@@ -47,6 +47,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef __TERMUX__
+#include <dlfcn.h>
+#endif
+
 uint64_t WSI_DEBUG;
 
 static const struct debug_control debug_control[] = {
@@ -201,6 +205,8 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(GetPhysicalDeviceFormatProperties2);
    WSI_GET_CB(GetPhysicalDeviceImageFormatProperties2);
    WSI_GET_CB(GetSemaphoreFdKHR);
+   WSI_GET_CB(ImportSemaphoreFdKHR);
+   WSI_GET_CB(ImportFenceFdKHR);
    WSI_GET_CB(ResetFences);
    WSI_GET_CB(QueueSubmit);
    WSI_GET_CB(WaitForFences);
@@ -208,7 +214,24 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(UnmapMemory);
    if (wsi->khr_present_wait)
       WSI_GET_CB(WaitSemaphores);
+#ifdef __TERMUX__
+   WSI_GET_CB(GetMemoryAndroidHardwareBufferANDROID);
+#endif
 #undef WSI_GET_CB
+
+#ifdef __TERMUX__
+   wsi->ahb.lib_android_handle = dlopen("libandroid.so", RTLD_LOCAL);
+   if (!wsi->ahb.lib_android_handle) {
+      result = VK_ERROR_INITIALIZATION_FAILED;
+      goto fail;
+   }
+   wsi->ahb.send = dlsym(wsi->ahb.lib_android_handle,
+                           "AHardwareBuffer_sendHandleToUnixSocket");
+   wsi->ahb.release = dlsym(wsi->ahb.lib_android_handle,
+                              "AHardwareBuffer_release");
+   wsi->ahb.allocate = dlsym(wsi->ahb.lib_android_handle,
+                              "AHardwareBuffer_allocate");
+#endif
 
 #ifdef VK_USE_PLATFORM_XCB_KHR
    result = wsi_x11_init_wsi(wsi, alloc, dri_options);
@@ -314,6 +337,9 @@ wsi_device_finish(struct wsi_device *wsi,
 #ifdef VK_USE_PLATFORM_XCB_KHR
    wsi_x11_finish_wsi(wsi, alloc);
 #endif
+#ifdef __TERMUX__
+   dlclose(wsi->ahb.lib_android_handle);
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -364,6 +390,11 @@ get_blit_type(const struct wsi_device *wsi,
       return wsi_cpu_image_needs_buffer_blit(wsi, cpu_params) ?
          WSI_SWAPCHAIN_BUFFER_BLIT : WSI_SWAPCHAIN_NO_BLIT;
    }
+#ifdef __TERMUX__
+   case WSI_IMAGE_TYPE_AHB: {
+      return WSI_SWAPCHAIN_NO_BLIT;
+   }
+#endif
 #ifdef HAVE_LIBDRM
    case WSI_IMAGE_TYPE_DRM: {
       const struct wsi_drm_image_params *drm_params =
@@ -384,6 +415,14 @@ get_blit_type(const struct wsi_device *wsi,
    }
 }
 
+#ifdef __TERMUX__
+VkResult
+wsi_configure_ahb_image(const struct wsi_swapchain *chain,
+                        const VkSwapchainCreateInfoKHR *pCreateInfo,
+                        const struct wsi_base_image_params *params,
+                        struct wsi_image_info *info);
+#endif
+
 static VkResult
 configure_image(const struct wsi_swapchain *chain,
                 const VkSwapchainCreateInfoKHR *pCreateInfo,
@@ -397,6 +436,11 @@ configure_image(const struct wsi_swapchain *chain,
          container_of(params, const struct wsi_cpu_image_params, base);
       return wsi_configure_cpu_image(chain, pCreateInfo, cpu_params, info);
    }
+#ifdef __TERMUX__
+   case WSI_IMAGE_TYPE_AHB: {
+      return wsi_configure_ahb_image(chain, pCreateInfo, params, info);
+   }
+#endif
 #ifdef HAVE_LIBDRM
    case WSI_IMAGE_TYPE_DRM: {
       const struct wsi_drm_image_params *drm_params =
@@ -757,6 +801,11 @@ wsi_destroy_image(const struct wsi_swapchain *chain,
                   struct wsi_image *image)
 {
    const struct wsi_device *wsi = chain->wsi;
+
+#ifdef __TERMUX__
+   if (chain->wsi->wants_ahb && image->ahb)
+      chain->wsi->ahb.release(image->ahb);
+#endif
 
 #ifndef _WIN32
    if (image->dma_buf_fd >= 0)
@@ -1167,8 +1216,16 @@ wsi_signal_semaphore_for_image(struct vk_device *device,
                                const struct wsi_image *image,
                                VkSemaphore _semaphore)
 {
-   if (device->physical->supported_sync_types == NULL)
-      return VK_SUCCESS;
+   if (device->physical->supported_sync_types == NULL) {
+      const VkImportSemaphoreFdInfoKHR import_fd_info = {
+         .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+         .semaphore = _semaphore,
+         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+         .fd = -1,
+         .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+      };
+      return chain->wsi->ImportSemaphoreFdKHR(chain->device, &import_fd_info);
+   }
 
    VK_FROM_HANDLE(vk_semaphore, semaphore, _semaphore);
 
@@ -1203,8 +1260,16 @@ wsi_signal_fence_for_image(struct vk_device *device,
                            const struct wsi_image *image,
                            VkFence _fence)
 {
-   if (device->physical->supported_sync_types == NULL)
-      return VK_SUCCESS;
+   if (device->physical->supported_sync_types == NULL) {
+      const VkImportFenceFdInfoKHR import_fd_info = {
+         .sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR,
+         .fence = _fence,
+         .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+         .fd = -1,
+         .flags = VK_FENCE_IMPORT_TEMPORARY_BIT,
+      };
+      return chain->wsi->ImportFenceFdKHR(chain->device, &import_fd_info);
+   }
 
    VK_FROM_HANDLE(vk_fence, fence, _fence);
 
@@ -2143,6 +2208,79 @@ wsi_create_cpu_linear_image_mem(const struct wsi_swapchain *chain,
    return VK_SUCCESS;
 }
 
+#ifdef __TERMUX__
+static VkResult
+wsi_init_image_ahb(const struct wsi_swapchain *chain, struct wsi_image *image,
+                   bool linear)
+{
+   const struct wsi_device *wsi = chain->wsi;
+   const VkMemoryGetAndroidHardwareBufferInfoANDROID memory_get_ahb_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+      .pNext = NULL,
+      .memory = linear ? image->blit.memory : image->memory,
+   };
+
+   return wsi->GetMemoryAndroidHardwareBufferANDROID(chain->device,
+                                                     &memory_get_ahb_info,
+                                                     &image->ahb);
+}
+
+static VkResult
+wsi_create_ahb_linear_image_mem(const struct wsi_swapchain *chain,
+                                const struct wsi_image_info *info,
+                                struct wsi_image *image)
+{
+   const struct wsi_device *wsi = chain->wsi;
+   VkResult result;
+
+   VkMemoryRequirements reqs;
+   wsi->GetImageMemoryRequirements(chain->device, image->image, &reqs);
+
+   VkSubresourceLayout layout;
+   wsi->GetImageSubresourceLayout(chain->device, image->image,
+                                  &(VkImageSubresource) {
+                                     .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                     .mipLevel = 0,
+                                     .arrayLayer = 0,
+                                  }, &layout);
+   assert(layout.offset == 0);
+
+   const VkMemoryDedicatedAllocateInfo memory_dedicated_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .image = image->image,
+      .buffer = VK_NULL_HANDLE,
+   };
+   VkExportMemoryAllocateInfo export_memory_info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+      .pNext = &memory_dedicated_info,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+   };
+   VkMemoryAllocateInfo memory_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &export_memory_info,
+      .allocationSize = 0,
+      .memoryTypeIndex =
+         wsi_select_device_memory_type(wsi, reqs.memoryTypeBits),
+   };
+
+   result = wsi->AllocateMemory(chain->device, &memory_info,
+                                &chain->alloc, &image->memory);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = wsi_init_image_ahb(chain, image, false);
+   if (result != VK_SUCCESS)
+      return result;
+
+   image->num_planes = 1;
+   image->row_pitches[0] = layout.rowPitch;
+   image->offsets[0] = 0;
+   image->drm_modifier = 0;
+
+   return VK_SUCCESS;
+}
+#endif
+
 static VkResult
 wsi_create_cpu_buffer_image_mem(const struct wsi_swapchain *chain,
                                 const struct wsi_image_info *info,
@@ -2214,6 +2352,31 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
 
    return VK_SUCCESS;
 }
+
+#ifdef __TERMUX__
+VkResult
+wsi_configure_ahb_image(const struct wsi_swapchain *chain,
+                        const VkSwapchainCreateInfoKHR *pCreateInfo,
+                        const struct wsi_base_image_params *params,
+                        struct wsi_image_info *info)
+{
+   assert(params->image_type == WSI_IMAGE_TYPE_AHB);
+   assert(chain->blit.type == WSI_SWAPCHAIN_NO_BLIT);
+
+   VkExternalMemoryHandleTypeFlags handle_types =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+   VkResult result = wsi_configure_image(chain, pCreateInfo,
+                                         handle_types, info);
+   if (result != VK_SUCCESS)
+      return result;
+
+   info->create.format = VK_FORMAT_R8G8B8A8_UNORM;
+   info->create_mem = wsi_create_ahb_linear_image_mem;
+
+   return VK_SUCCESS;
+}
+#endif
 
 VKAPI_ATTR VkResult VKAPI_CALL
 wsi_WaitForPresentKHR(VkDevice device, VkSwapchainKHR _swapchain,

@@ -243,6 +243,7 @@ elif _vulkan_drivers.contains('all')
                       'nouveau']
 endif
 
+with_wrapper_vk = _vulkan_drivers.contains('wrapper')
 with_intel_vk = _vulkan_drivers.contains('intel')
 with_intel_hasvk = _vulkan_drivers.contains('intel_hasvk')
 with_amd_vk = _vulkan_drivers.contains('amd')

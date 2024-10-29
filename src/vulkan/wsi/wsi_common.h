@@ -32,6 +32,10 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
 
+#ifdef __TERMUX__
+#include <android/hardware_buffer.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -168,6 +172,18 @@ struct wsi_device {
       bool ignore_suboptimal;
    } x11;
 
+#ifdef __TERMUX__
+   struct {
+      void *lib_android_handle;
+      int (*send)(const AHardwareBuffer *buffer, int socketFd);
+      int (*allocate)(const AHardwareBuffer_Desc *desc,
+                      AHardwareBuffer **outBuffer);
+      void (*release)(AHardwareBuffer *buffer);
+   } ahb;
+
+   bool wants_ahb;
+#endif
+
    struct {
       void *(*get_d3d12_command_queue)(VkDevice device);
       /* Needs to be per VkDevice, not VkPhysicalDevice, depends on queue config */
@@ -263,12 +279,17 @@ struct wsi_device {
    WSI_CB(GetPhysicalDeviceFormatProperties2);
    WSI_CB(GetPhysicalDeviceImageFormatProperties2);
    WSI_CB(GetSemaphoreFdKHR);
+   WSI_CB(ImportSemaphoreFdKHR);
+   WSI_CB(ImportFenceFdKHR);
    WSI_CB(ResetFences);
    WSI_CB(QueueSubmit);
    WSI_CB(WaitForFences);
    WSI_CB(MapMemory);
    WSI_CB(UnmapMemory);
    WSI_CB(WaitSemaphores);
+#ifdef __TERMUX__
+   WSI_CB(GetMemoryAndroidHardwareBufferANDROID);
+#endif
 #undef WSI_CB
 
     struct wsi_interface *                  wsi[VK_ICD_WSI_PLATFORM_MAX];

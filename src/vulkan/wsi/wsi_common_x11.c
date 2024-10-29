@@ -22,7 +22,6 @@
  */
 
 #include <X11/Xlib-xcb.h>
-#include <X11/xshmfence.h>
 #define XK_MISCELLANY
 #define XK_LATIN1
 #include <X11/keysymdef.h>
@@ -67,6 +66,10 @@
 #ifdef HAVE_SYS_SHM_H
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#endif
+
+#ifdef __TERMUX__
+#include <sys/socket.h>
 #endif
 
 #ifndef XCB_PRESENT_OPTION_ASYNC_MAY_TEAR
@@ -1057,7 +1060,6 @@ struct x11_image {
    xcb_pixmap_t                              pixmap;
    xcb_xfixes_region_t                       update_region; /* long lived XID */
    xcb_xfixes_region_t                       update_area;   /* the above or None */
-   struct xshmfence *                        shm_fence;
    uint32_t                                  sync_fence;
    xcb_shm_seg_t                             shmseg;
    int                                       shmid;
@@ -1401,8 +1403,6 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
    if (chain->has_dri3_modifiers)
       options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
 #endif
-
-   xshmfence_reset(image->shm_fence);
 
    if (!chain->base.image_info.explicit_sync) {
       ++chain->sent_image_count;
@@ -1771,9 +1771,6 @@ x11_acquire_next_image(struct wsi_swapchain *anv_chain,
       return result;
 
    assert(*image_index < chain->base.image_count);
-   if (chain->images[*image_index].shm_fence &&
-       !chain->base.image_info.explicit_sync)
-      xshmfence_await(chain->images[*image_index].shm_fence);
 
    return result;
 }
@@ -2059,7 +2056,6 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
    xcb_generic_error_t *error = NULL;
    VkResult result;
    uint32_t bpp = 32;
-   int fence_fd;
 
    result = wsi_create_image(&chain->base, &chain->base.image_info,
                              &image->base);
@@ -2098,6 +2094,17 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
       /* If the image has a modifier, we must have DRI3 v1.2. */
       assert(chain->has_dri3_modifiers);
 
+#ifdef __TERMUX__
+      int sock_fds[2] = { -1, -1 };
+      if (chain->base.wsi->wants_ahb) {
+         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds) < 0) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+         chain->base.wsi->ahb.send(image->base.ahb, sock_fds[0]);
+         image->base.dma_buf_fd = sock_fds[1];
+         image->base.drm_modifier = 1255;
+      }
+#endif
       /* XCB requires an array of file descriptors but we only have one */
       int fds[4] = { -1, -1, -1, -1 };
       for (int i = 0; i < image->base.num_planes; i++) {
@@ -2128,6 +2135,16 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
                                               chain->depth, bpp,
                                               image->base.drm_modifier,
                                               fds);
+#ifdef __TERMUX__
+      if (chain->base.wsi->wants_ahb) {
+         xcb_flush(chain->conn);
+         read(sock_fds[0], &image->base.dma_buf_fd, 1);
+         for (int i = 0; i < ARRAY_SIZE(sock_fds); i++) {
+            close(sock_fds[i]);
+         }
+         image->base.dma_buf_fd = -1;
+      }
+#endif
    } else
 #endif
    {
@@ -2140,14 +2157,23 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
          return VK_ERROR_OUT_OF_HOST_MEMORY;
 
       cookie =
-         xcb_dri3_pixmap_from_buffer_checked(chain->conn,
-                                             image->pixmap,
-                                             chain->window,
-                                             image->base.sizes[0],
-                                             pCreateInfo->imageExtent.width,
-                                             pCreateInfo->imageExtent.height,
-                                             image->base.row_pitches[0],
-                                             chain->depth, bpp, fd);
+         xcb_dri3_pixmap_from_buffers_checked(chain->conn,
+                                              image->pixmap,
+                                              chain->window,
+                                              image->base.num_planes,
+                                              pCreateInfo->imageExtent.width,
+                                              pCreateInfo->imageExtent.height,
+                                              image->base.row_pitches[0],
+                                              image->base.offsets[0],
+                                              image->base.row_pitches[1],
+                                              image->base.offsets[1],
+                                              image->base.row_pitches[2],
+                                              image->base.offsets[2],
+                                              image->base.row_pitches[3],
+                                              image->base.offsets[3],
+                                              chain->depth, bpp,
+                                              1274,
+                                              &fd);
    }
 
    error = xcb_request_check(chain->conn, cookie);
@@ -2178,31 +2204,7 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
 #endif
 
 out_fence:
-   fence_fd = xshmfence_alloc_shm();
-   if (fence_fd < 0)
-      goto fail_pixmap;
-
-   image->shm_fence = xshmfence_map_shm(fence_fd);
-   if (image->shm_fence == NULL)
-      goto fail_shmfence_alloc;
-
-   image->sync_fence = xcb_generate_id(chain->conn);
-   xcb_dri3_fence_from_fd(chain->conn,
-                          image->pixmap,
-                          image->sync_fence,
-                          false,
-                          fence_fd);
-
-   xshmfence_trigger(image->shm_fence);
-
    return VK_SUCCESS;
-
-fail_shmfence_alloc:
-   close(fence_fd);
-
-fail_pixmap:
-   cookie = xcb_free_pixmap(chain->conn, image->pixmap);
-   xcb_discard_reply(chain->conn, cookie.sequence);
 
 fail_image:
    wsi_destroy_image(&chain->base, &image->base);
@@ -2218,10 +2220,6 @@ x11_image_finish(struct x11_swapchain *chain,
    xcb_void_cookie_t cookie;
 
    if (!chain->base.wsi->sw || chain->has_mit_shm) {
-      cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
-      xcb_discard_reply(chain->conn, cookie.sequence);
-      xshmfence_unmap_shm(image->shm_fence);
-
       cookie = xcb_free_pixmap(chain->conn, image->pixmap);
       xcb_discard_reply(chain->conn, cookie.sequence);
 
@@ -2618,6 +2616,12 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
          .alloc_shm = wsi_conn->has_mit_shm ? &alloc_shm : NULL,
       };
       image_params = &cpu_image_params.base;
+#ifdef __TERMUX__
+   } else if (wsi_device->wants_ahb) {
+      image_params = &(struct wsi_base_image_params){
+         .image_type = WSI_IMAGE_TYPE_AHB,
+      };
+#endif
    } else {
       drm_image_params = (struct wsi_drm_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_DRM,
